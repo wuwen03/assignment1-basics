@@ -1,0 +1,166 @@
+import multiprocessing as mp
+import regex as re
+import os
+import collections
+import cppyy
+import json
+
+from .pretokenization_example import find_chunk_boundaries
+from .utils import SimpleMapReduce, gpt2_bytes_to_unicode
+
+lib = os.path.join(os.path.dirname(__file__), "libbpe_trainer.so")
+if os.path.exists(lib):
+    cppyy.cppdef("""
+    extern "C"
+    int bpe_trainer(const char* input_file, const char * merges_file, int vocab_size);
+    """)
+    cppyy.load_library(lib)
+else:
+    with open(os.path.join(os.path.dirname(__file__), "bpe_trainer.cpp"), "r") as f:
+        cppyy.cppdef(f.read())
+
+def pretoken_mapper(chunks: list[tuple]):
+    result = collections.defaultdict(int)
+    for chunk in chunks:
+        start, end, path, special_tokens = chunk
+        with open(path, 'rb') as f:
+            f.seek(start)
+            content = f.read(end - start).decode('utf-8', errors='ignore')
+            dlim = "|".join([re.escape(special) for special in special_tokens])
+            PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+            for doc_match in re.splititer(dlim, content):
+                for token in re.finditer(PAT, doc_match):
+                    utf8_bytes = token.group().encode('utf-8')
+                    if len(utf8_bytes) == 1:
+                        continue
+                    result[tuple(list(utf8_bytes))] += 1
+    return list(result.items())
+
+def pretoken_reducer(token: tuple[bytes], counts: list[int]) -> tuple[tuple[bytes], int]:
+    return (token, sum(counts))
+
+class BPE_Trainer:
+    def __init__(
+        self,
+        input_path: str | os.PathLike,
+        vocab_size: int,
+        special_tokens: list[str]
+    ):
+        self.trained = False
+        self.map_reduce = SimpleMapReduce(max(1, mp.cpu_count() // 2))
+        self.input_path = input_path
+        self.vocab_size = vocab_size
+        self.special_tokens = special_tokens
+        self.gpt2_byte_decoder = {v: k for k, v in gpt2_bytes_to_unicode().items()}
+        self.gpt2_byte_encoder = {k: v for k, v in gpt2_bytes_to_unicode().items()}
+        self.merges: list[tuple[bytes, bytes]] = []
+        self.vocab: dict[int, bytes] = {}
+        for i in range(256):
+            self.vocab[i] = bytes([i])
+        for i, special_token in enumerate(special_tokens):
+            self.vocab[256 + i] = special_token.encode('utf-8')
+
+    def train(self):
+        # 1. pretoken
+        with open(self.input_path, 'rb') as f:
+            boundaries = find_chunk_boundaries(f, max(1, mp.cpu_count() // 2), b"<|endoftext|>")
+        chunks = []
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            chunks.append((start, end, self.input_path, self.special_tokens))
+        pretokened = self.map_reduce.execute(chunks, pretoken_mapper, pretoken_reducer)
+        cur_tokens = list(pretokened.items())
+        # print(len(cur_tokens))
+
+        if not os.path.exists("tmp"):
+            os.mkdir("tmp")
+        with open("tmp/pretokened.txt", "w") as f:
+            f.write(f"{len(cur_tokens)}\n")
+            for token, count in cur_tokens:
+                f.write(f"{len(token)} ")
+                for byte in token:
+                    f.write(f"{byte} ")
+                f.write(f"{count}\n")
+
+        
+        cppyy.gbl.bpe_trainer("tmp/pretokened.txt", "tmp/merges.txt", self.vocab_size - len(self.vocab))
+
+        with open("tmp/merges.txt", "rb") as f:
+            f.seek(0, os.SEEK_END)
+            file_size = f.tell()
+            f.seek(0)
+            # print(file_size)
+            while True:
+                if f.tell() == file_size:
+                    break
+                first_size = int.from_bytes(f.read(4), byteorder='little')
+                first = f.read(first_size)
+                second_size = int.from_bytes(f.read(4), byteorder='little')
+                second = f.read(second_size)
+                # print(first_size, second_size, first, second)
+                # print(first, second)
+                self.vocab[len(self.vocab)] = first + second
+                self.merges.append((first, second))
+
+    def result(self) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+        # print(f"vocab size: {len(self.vocab)} merges size: {len(self.merges)}")
+        return (self.vocab, self.merges)
+    
+    def dump(self):
+        encoded_vocab = {}
+        for id, token in self.vocab.items():
+            token = "".join(self.gpt2_byte_encoder[t] for t in token)
+            encoded_vocab[token] = id
+        with open("tmp/vocab.json", "w", encoding='utf-8') as f:
+            json.dump(encoded_vocab, f, ensure_ascii=False, indent=2)
+
+        with open("tmp/merges.txt", "w") as f:
+            for merge in self.merges:
+                first, second = merge
+                first = "".join(self.gpt2_byte_encoder[t] for t in first)
+                second = "".join(self.gpt2_byte_encoder[t] for t in second)
+                f.write(f"{first} {second}\n")
+
+def train_bpe_impl(
+    input_path: str | os.PathLike,
+    vocab_size: int,
+    special_tokens: list[str],
+    **kwargs,
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """Given the path to an input corpus, run train a BPE tokenizer and
+    output its vocabulary and merges.
+
+    Args:
+        input_path (str | os.PathLike): Path to BPE tokenizer training data.
+        vocab_size (int): Total number of items in the tokenizer's vocabulary (including special tokens).
+        special_tokens (list[str]): A list of string special tokens to be added to the tokenizer vocabulary.
+            These strings will never be split into multiple tokens, and will always be
+            kept as a single token. If these special tokens occur in the `input_path`,
+            they are treated as any other string.
+
+    Returns:
+        tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+            vocab:
+                The trained tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
+                to bytes (token bytes)
+            merges:
+                BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
+                representing that <token1> was merged with <token2>.
+                Merges are ordered by order of creation.
+    """
+    trainer = BPE_Trainer(input_path, vocab_size, special_tokens)
+    trainer.train()
+    if 'save' in kwargs:
+        trainer.dump()
+    return trainer.result()
+
+if __name__ == "__main__":
+    input_path = "/data/nlp_course/pre_Owt_Train_Tokenizer.txt"
+    input_path = "/data/nlp_course/pre_TinyStory_Train_Tokenizer.txt"
+    vocab_size = 10000
+    special_tokens = ["<|endoftext|>"]
+    vocab, merges = train_bpe_impl(
+        input_path=input_path,
+        vocab_size=vocab_size,
+        special_tokens=special_tokens,
+        save = True
+    )
