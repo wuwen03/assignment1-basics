@@ -4,6 +4,8 @@ import itertools
 from typing import List, Tuple, Any, Callable, Dict
 from functools import lru_cache
 
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
 class SimpleMapReduce:
     def __init__(self, num_workers=None):
         self.num_workers = num_workers or multiprocessing.cpu_count()
