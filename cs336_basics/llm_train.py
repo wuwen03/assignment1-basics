@@ -1,12 +1,15 @@
+import numpy as np
 import torch
 import torch.nn as nn
-from jaxtyping import Bool, Float, Int
 from torch import Tensor
-import einx
-import einops
+from jaxtyping import Bool, Float, Int
 import math
 from collections.abc import Callable, Iterable
 from typing import Optional
+import numpy.typing as npt
+import random
+from typing import IO, Any, BinaryIO
+import os
 
 def cross_entropy(
     inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]
@@ -100,3 +103,40 @@ def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: flo
             if param.grad is None:
                 continue
             param.grad = param.grad * max_l2_norm / (l2_norm + eps)
+
+def get_batch(
+    dataset: npt.NDArray, batch_size: int, context_length: int, device: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    train_batch = torch.empty(batch_size, context_length)
+    validation_batch = torch.empty(batch_size, context_length)
+    for idx in range(batch_size):
+        start = random.randint(0, len(dataset) - context_length - 1)
+        train_batch[idx] = torch.Tensor(dataset[start:start+context_length])
+        validation_batch[idx] = torch.Tensor(dataset[start+1:start+context_length+1])
+    train_batch.to(device)
+    validation_batch.to(device)
+    # print(train_batch, tag_batch)
+    return (train_batch, validation_batch)
+
+def save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    out: str | os.PathLike | BinaryIO | IO[bytes],
+):
+    checkpoint = {
+        "iteration": iteration,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict()
+    }
+    torch.save(checkpoint, out)
+
+def load_checkpoint(
+    src: str | os.PathLike | BinaryIO | IO[bytes],
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> int:
+    checkpoint = torch.load(src)
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    return checkpoint["iteration"]
