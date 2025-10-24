@@ -62,6 +62,7 @@ class BPE_Trainer:
             self.vocab[i] = bytes([i])
         for i, special_token in enumerate(special_tokens):
             self.vocab[256 + i] = special_token.encode('utf-8')
+        self.result_path = "tmp/"
 
     def train(self):
         # 1. pretoken
@@ -113,10 +114,11 @@ class BPE_Trainer:
         for id, token in self.vocab.items():
             token = "".join(self.gpt2_byte_encoder[t] for t in token)
             encoded_vocab[token] = id
-        with open("tmp/vocab.json", "w", encoding='utf-8') as f:
+        vocab_path = os.path.join(self.result_path, "vocab.json")
+        with open(vocab_path, "w", encoding='utf-8') as f:
             json.dump(encoded_vocab, f, ensure_ascii=False, indent=2)
-
-        with open("tmp/merges.txt", "w") as f:
+        merges_path = os.path.join(self.result_path, "merges.txt")
+        with open(merges_path, "w") as f:
             for merge in self.merges:
                 first, second = merge
                 first = "".join(self.gpt2_byte_encoder[t] for t in first)
@@ -127,7 +129,7 @@ def train_bpe_impl(
     input_path: str | os.PathLike,
     vocab_size: int,
     special_tokens: list[str],
-    **kwargs,
+    result_path=None,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """Given the path to an input corpus, run train a BPE tokenizer and
     output its vocabulary and merges.
@@ -152,7 +154,8 @@ def train_bpe_impl(
     """
     trainer = BPE_Trainer(input_path, vocab_size, special_tokens)
     trainer.train()
-    if 'save' in kwargs:
+    if result_path is not None:
+        trainer.result_path = result_path
         trainer.dump()
     return trainer.result()
 

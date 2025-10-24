@@ -114,7 +114,7 @@ int bpe_trainer(const char* input_file, const char * merges_file, int vocab_size
     }
     std::fstream fout(merges_file, std::ios::out | std::ios::binary);
     while (vocab_size--) {
-        // std::cout << "vocab size left " << vocab_size << "\n";
+        std::cout << "vocab size left " << vocab_size << "\n";
         if (to_merge.empty()) {
             break;
         }
