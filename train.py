@@ -4,6 +4,8 @@ import tqdm
 import numpy as np
 from cs336_basics.bpe_trainer import train_bpe_impl
 from cs336_basics.bpe_tokenizer import BPETokenizer
+from cs336_basics.llm import Transformer
+from cs336_basics.llm_train import AdamW, get_batch, cross_entropy, save_checkpoint
 
 def train_tokenizer(
     tokenizer: str,
@@ -65,9 +67,32 @@ def prepare_dataset(
         write_back(buffer, dataset_path)
 
 def train_model(
-    tokenizer: str
+    dataset_path: str,
+    checkpoint_path: str,
+    vocab_size: int,
+    context_length: int,
+    d_model: int,
+    d_ff: int,
+    rope_theta: int,
+    n_layers: int,
+    n_heads: int,
+    batch_size: int,
+    total_tokens: int,
 ):
-    pass
+    with open(dataset_path, mode='r') as f:
+        f.seek(0, os.SEEK_END)
+        count = f.tell() // np.dtype(np.int64).itemsize
+    mmap = np.memmap(dataset_path, dtype=np.int64, mode='r', shape=(count,))
+    model = Transformer(vocab_size, context_length, d_model, n_layers, n_heads, d_ff, rope_theta)
+    optimizer = AdamW(model.parameters())
+    step = int(total_tokens / batch_size / context_length)
+    for iter in range(step):
+        x, y = get_batch(mmap, batch_size, context_length)
+        optimizer.zero_grad()
+        loss = cross_entropy(model(x), y)
+        loss.backward()
+        optimizer.step()
+        save_checkpoint(model, optimizer, iter, checkpoint_path)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="Train tokenizer and model")
@@ -83,7 +108,7 @@ if __name__ == "__main__":
     parser_dataset.add_argument("-i", "--input", type=str, required=True, help="dataset src")
 
     parser_model = subparsers.add_parser("model", help="train model")
-    parser_model.add_argument("-t", "--tokenizer", type=str, required=True, help="tokenizer's name")
+    parser_model.add_argument("-d", "--dataset", type=str, required=True, help="dataset path")
 
     args = parser.parse_args()
     if args.command == "tokenizer":
