@@ -2,10 +2,21 @@ import os
 import argparse
 import tqdm
 import numpy as np
+import multiprocessing as mp
+import torch
+
+from cs336_basics.utils import SimpleMapReduce
+from cs336_basics.pretokenization_example import find_chunk_boundaries
 from cs336_basics.bpe_trainer import train_bpe_impl
 from cs336_basics.bpe_tokenizer import BPETokenizer
 from cs336_basics.llm import Transformer
-from cs336_basics.llm_train import AdamW, get_batch, cross_entropy, save_checkpoint
+from cs336_basics.llm_train import (
+    AdamW,
+    get_batch,
+    cross_entropy,
+    save_checkpoint,
+    gradient_clipping,
+)
 
 def train_tokenizer(
     tokenizer: str,
@@ -39,6 +50,13 @@ def write_back(tokens: list[int], dataset_path: str):
     mmap[count:new_count] = tokens
     mmap.flush()
 
+def prepare_dataset_chunk(tokenizer:BPETokenizer, tmp_path:str, input_path:str, start:int, end:int):
+    with open(input_path, mode="r") as f:
+        token_count = 0
+        f.seek(start)
+        content = f.read(end - start)
+        buffer = tokenizer.encode(content)
+        write_back(buffer, tmp_path)
 
 def prepare_dataset(
     tokenizer_name: str,
@@ -53,22 +71,34 @@ def prepare_dataset(
     dataset_path = os.path.join(dataset_dir, mangled)
 
     tokenizer = BPETokenizer.from_files(vocab_path, merges_path,["<|endoftext|>"])
-    with open(input_path, mode="r") as f:
-        token_count = 0
-        buffer = []
-        for token in tokenizer.encode_iterable(f):
-            buffer.append(token)
-            if len(buffer) < 200000:
-                continue
-            token_count += len(buffer)
-            write_back(buffer, dataset_path)
-            buffer = []
-            print(f"\rtoken count: {token_count}", end="")
-        write_back(buffer, dataset_path)
+
+    tmp_path = os.path.join(dataset_dir,"tmp")
+    os.makedirs(tmp_path, exist_ok=True)
+    with open(input_path, mode='rb') as f:
+        boundaries = find_chunk_boundaries(f, mp.cpu_count() * 4, b"<|endoftext|>")
+
+    args = []
+    for i, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+        tmp = os.path.join(tmp_path, str(i)+".tmp")
+        args.append((tokenizer, tmp, input_path, start, end))
+
+    with mp.Pool(processes=mp.cpu_count()//2) as pool:
+        pool.starmap(prepare_dataset_chunk, args)
+
+    for idx in range(len(boundaries) - 1):
+        tmp = os.path.join(tmp_path, str(idx)+".tmp")
+        tmp_count = os.path.getsize(tmp) // np.dtype(np.int64).itemsize
+        tmp_mmap = np.memmap(tmp, dtype=np.int64, mode='r+', shape=(tmp_count,))
+        write_back(tmp_mmap, dataset_path)
+
+    # verify
+    ds_count = os.path.getsize(dataset_path) // np.dtype(np.int64).itemsize
+    ds_mmap = np.memmap(dataset_path, dtype=np.int64, mode='r+', shape=(ds_count,))
+    print(tokenizer.decode(ds_mmap[-1000:]))
 
 def train_model(
     dataset_path: str,
-    checkpoint_path: str,
+    checkpoint_dir: str,
     vocab_size: int,
     context_length: int,
     d_model: int,
@@ -79,20 +109,33 @@ def train_model(
     batch_size: int,
     total_tokens: int,
 ):
-    with open(dataset_path, mode='r') as f:
-        f.seek(0, os.SEEK_END)
-        count = f.tell() // np.dtype(np.int64).itemsize
+    count = os.path.getsize(dataset_path) // np.dtype(np.int64).itemsize
     mmap = np.memmap(dataset_path, dtype=np.int64, mode='r', shape=(count,))
-    model = Transformer(vocab_size, context_length, d_model, n_layers, n_heads, d_ff, rope_theta)
+    device = "cuda:0"
+    model = Transformer(
+        vocab_size,
+        context_length,
+        d_model,
+        n_layers,
+        n_heads,
+        d_ff,
+        rope_theta,
+        device=device
+    )
     optimizer = AdamW(model.parameters())
     step = int(total_tokens / batch_size / context_length)
+    max_norm = 1e-2
+    os.makedirs(checkpoint_dir, exist_ok=True)
     for iter in range(step):
-        x, y = get_batch(mmap, batch_size, context_length)
+        x, y = get_batch(mmap, batch_size, context_length, device)
         optimizer.zero_grad()
         loss = cross_entropy(model(x), y)
         loss.backward()
+        gradient_clipping(model.parameters(), max_norm)
         optimizer.step()
-        save_checkpoint(model, optimizer, iter, checkpoint_path)
+        print(iter, f"loss {loss.item():.2f} perplexity {torch.exp(loss.detach()).item():.2f}")
+        if iter % 50 == 0:
+            save_checkpoint(model, optimizer, iter, os.path.join(checkpoint_dir, str(iter)+".data"))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="Train tokenizer and model")
@@ -108,7 +151,17 @@ if __name__ == "__main__":
     parser_dataset.add_argument("-i", "--input", type=str, required=True, help="dataset src")
 
     parser_model = subparsers.add_parser("model", help="train model")
-    parser_model.add_argument("-d", "--dataset", type=str, required=True, help="dataset path")
+    parser_model.add_argument("--dataset", type=str, required=True, help="dataset path")
+    parser_model.add_argument("--checkpoint", type=str, required=True, help="checkpoint path")
+    parser_model.add_argument("--vocab", type=int, required=True, help="vocab size")
+    parser_model.add_argument("--context", type=int, required=True, help="context length")
+    parser_model.add_argument("--dmodel", type=int, required=True, help="d_model")
+    parser_model.add_argument("--dff", type=int, required=True, help="d_ff")
+    parser_model.add_argument("--rope", type=int, required=True, help="repe theta")
+    parser_model.add_argument("--layers", type=int, required=True, help="n_layers")
+    parser_model.add_argument("--heads", type=int,required=True, help="n_heads")
+    parser_model.add_argument("--batch", type=int, required=True, help="batch size")
+    parser_model.add_argument("--total", type=int, required=True, help="total tokens")
 
     args = parser.parse_args()
     if args.command == "tokenizer":
@@ -120,4 +173,16 @@ if __name__ == "__main__":
     elif args.command == "dataset":
         prepare_dataset(args.tokenizer, args.input)
     elif args.command == "model":
-        raise NotImplementedError
+        train_model(
+            args.dataset,
+            args.checkpoint,
+            args.vocab,
+            args.context,
+            args.dmodel,
+            args.dff,
+            args.rope,
+            args.layers,
+            args.heads,
+            args.batch,
+            args.total
+        )

@@ -68,9 +68,9 @@ class SwiGLU(torch.nn.Module):
         super().__init__()
         self.d_model = d_model
         self.d_ff = d_ff
-        self.w1 = Linear(d_model, d_ff)
-        self.w2 = Linear(d_ff, d_model)
-        self.w3 = Linear(d_model, d_ff)
+        self.w1 = Linear(d_model, d_ff, device=device)
+        self.w2 = Linear(d_ff, d_model, device=device)
+        self.w3 = Linear(d_model, d_ff, device=device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         a = self.w1.forward(x)
@@ -94,6 +94,7 @@ class RoPE(torch.nn.Module):
                     [[math.cos(theta_ik), -math.sin(theta_ik)],
                     [math.sin(theta_ik), math.cos(theta_ik)]]
                 )
+        self.rope_buffer = self.rope_buffer.to(device=device)
 
         # for _forward (just for debugging)
         pos = torch.arange(max_seq_len, dtype=torch.float32)
@@ -205,7 +206,7 @@ class TransformerBlock(torch.nn.Module):
         x: Float[Tensor, " batch sequence_length d_model"]
      ) -> Float[Tensor, " batch sequence_length d_model"]:
         seq =  x.shape[-2]
-        y = x + self.attn(self.ln1(x), torch.arange(0, seq, dtype=torch.int))
+        y = x + self.attn(self.ln1(x), torch.arange(0, seq, device=x.device, dtype=torch.int))
         res = y + self.ffn(self.ln2(y))
         return res
     
@@ -229,7 +230,7 @@ class Transformer(torch.nn.Module):
             for _ in range(num_layers)
         ]
         self.ln_final = RMSNorm(d_model, **factory_kwargs)
-        self.lm_head = Linear(d_model, vocab_size)
+        self.lm_head = Linear(d_model, vocab_size, **factory_kwargs)
 
     def forward(self, 
         x: Int[Tensor, " batch_size sequence_length"]

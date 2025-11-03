@@ -92,11 +92,20 @@ def get_lr_cosine_schedule(
         return min_learning_rate
     
 def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float, eps=1e-6) -> None:
-    grads = torch.stack(
-        [
-            p.grad for p in parameters if p.grad is not None
-        ]
-    ).reshape(-1)
+    # parameters = list(parameters)
+    # grads = torch.stack(
+    #     [
+    #         p.grad for p in parameters if p.grad is not None
+    #     ]
+    # ).reshape(-1)
+    grads = []
+    for p in parameters:
+        if p.grad is not None:
+            grads.append(p.grad.detach().view(-1))
+    if not grads:
+        return
+    grads = torch.cat(grads)
+    # torch.nn.utils.clip_grad_norm_()
     l2_norm = (grads * grads).sum().sqrt()
     if l2_norm > max_l2_norm:
         for param in parameters:
@@ -107,8 +116,8 @@ def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: flo
 def get_batch(
     dataset: npt.NDArray, batch_size: int, context_length: int, device: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    train_batch = torch.empty(batch_size, context_length)
-    validation_batch = torch.empty(batch_size, context_length)
+    train_batch = torch.empty(batch_size, context_length, dtype=torch.long)
+    validation_batch = torch.empty(batch_size, context_length, dtype=torch.long)
     for idx in range(batch_size):
         start = random.randint(0, len(dataset) - context_length - 1)
         train_batch[idx] = torch.Tensor(dataset[start:start+context_length])
