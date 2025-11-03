@@ -4,6 +4,7 @@ import os
 import collections
 import cppyy
 import json
+from collections import defaultdict
 
 from .pretokenization_example import find_chunk_boundaries
 from .utils import SimpleMapReduce, gpt2_bytes_to_unicode, PAT
@@ -45,7 +46,7 @@ def pretoken_reducer(token: tuple[bytes], counts: list[int]) -> tuple[tuple[byte
 class BPE_Trainer:
     def __init__(
         self,
-        input_path: str | os.PathLike,
+        input_path: str | os.PathLike | None,
         vocab_size: int,
         special_tokens: list[str]
     ):
@@ -64,19 +65,8 @@ class BPE_Trainer:
             self.vocab[256 + i] = special_token.encode('utf-8')
         self.result_path = "tmp/"
 
-    def train(self):
-        # 1. pretoken
-        with open(self.input_path, 'rb') as f:
-            boundaries = find_chunk_boundaries(f, max(1, mp.cpu_count() // 2), b"<|endoftext|>")
-        chunks = []
-        for start, end in zip(boundaries[:-1], boundaries[1:]):
-            chunks.append((start, end, self.input_path, self.special_tokens))
-        pretokened = self.map_reduce.execute(chunks, pretoken_mapper, pretoken_reducer)
-        cur_tokens = list(pretokened.items())
-        # print(len(cur_tokens))
-
-        if not os.path.exists("tmp"):
-            os.mkdir("tmp")
+    def _train(self, cur_tokens:list[tuple[tuple[bytes], int]]):
+        os.makedirs("tmp", exist_ok=True)
         with open("tmp/pretokened.txt", "w") as f:
             f.write(f"{len(cur_tokens)}\n")
             for token, count in cur_tokens:
@@ -104,6 +94,28 @@ class BPE_Trainer:
                 # print(first, second)
                 self.vocab[len(self.vocab)] = first + second
                 self.merges.append((first, second))
+
+    def train(self):
+        assert(self.input_path is not None)
+        # 1. pretoken
+        with open(self.input_path, 'rb') as f:
+            boundaries = find_chunk_boundaries(f, max(1, mp.cpu_count() // 2), b"<|endoftext|>")
+        chunks = []
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            chunks.append((start, end, self.input_path, self.special_tokens))
+        pretokened = self.map_reduce.execute(chunks, pretoken_mapper, pretoken_reducer)
+        cur_tokens = list(pretokened.items())
+        # print(len(cur_tokens))
+        self._train(cur_tokens)
+
+    def train_with_pretoken(self, pretokens:list[str]):
+        assert(self.input_path is None)
+        cur_tokens = defaultdict(0)
+        for token in pretokens:
+            utf8_bytes = token.encode('utf-8')
+            cur_tokens[tuple(list(utf8_bytes))] += 1
+        cur_tokens = list(cur_tokens.items())
+        self._train(cur_tokens)
 
     def result(self) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
         # print(f"vocab size: {len(self.vocab)} merges size: {len(self.merges)}")
