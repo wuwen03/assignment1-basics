@@ -9,6 +9,7 @@ from memory_profiler import profile
 
 from .utils import gpt2_bytes_to_unicode, PAT
 
+
 class BPETokenizer:
     def __init__(
             self,
