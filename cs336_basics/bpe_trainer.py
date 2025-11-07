@@ -110,7 +110,7 @@ class BPE_Trainer:
 
     def train_with_pretoken(self, pretokens:list[str]):
         assert(self.input_path is None)
-        cur_tokens = defaultdict(0)
+        cur_tokens = defaultdict(int)
         for token in pretokens:
             utf8_bytes = token.encode('utf-8')
             cur_tokens[tuple(list(utf8_bytes))] += 1

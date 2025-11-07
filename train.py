@@ -1,9 +1,10 @@
 import os
 import argparse
-import tqdm
+from tqdm import tqdm
 import numpy as np
 import multiprocessing as mp
 import torch
+import shutil
 
 from cs336_basics.utils import SimpleMapReduce
 from cs336_basics.pretokenization_example import find_chunk_boundaries
@@ -58,6 +59,9 @@ def prepare_dataset_chunk(tokenizer:BPETokenizer, tmp_path:str, input_path:str, 
         buffer = tokenizer.encode(content)
         write_back(buffer, tmp_path)
 
+def star_wrapper(args):
+    prepare_dataset_chunk(*args)
+
 def prepare_dataset(
     tokenizer_name: str,
     input_path: str,
@@ -72,29 +76,32 @@ def prepare_dataset(
 
     tokenizer = BPETokenizer.from_files(vocab_path, merges_path,["<|endoftext|>"])
 
-    tmp_path = os.path.join(dataset_dir,"tmp")
-    os.makedirs(tmp_path, exist_ok=True)
+    tmp_dir_path = os.path.join(dataset_dir,"tmp")
+    if os.path.exists(tmp_dir_path):
+        os.rmdir(tmp_dir_path)
+    os.makedirs(tmp_dir_path, exist_ok=True)
     with open(input_path, mode='rb') as f:
         boundaries = find_chunk_boundaries(f, mp.cpu_count() * 4, b"<|endoftext|>")
 
     args = []
     for i, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
-        tmp = os.path.join(tmp_path, str(i)+".tmp")
+        tmp = os.path.join(tmp_dir_path, str(i)+".tmp")
         args.append((tokenizer, tmp, input_path, start, end))
 
     with mp.Pool(processes=mp.cpu_count()//2) as pool:
-        pool.starmap(prepare_dataset_chunk, args)
-
-    for idx in range(len(boundaries) - 1):
-        tmp = os.path.join(tmp_path, str(idx)+".tmp")
-        tmp_count = os.path.getsize(tmp) // np.dtype(np.int64).itemsize
-        tmp_mmap = np.memmap(tmp, dtype=np.int64, mode='r+', shape=(tmp_count,))
-        write_back(tmp_mmap, dataset_path)
+        for _ in tqdm(pool.imap_unordered(star_wrapper, args), total=len(args), desc="Tokenizing"):
+            pass
+    with open(dataset_path, "wb") as out:
+        for idx in tqdm(range(len(boundaries) - 1), desc="Merging"):
+            tmp = os.path.join(tmp_dir_path, f"{idx}.tmp")
+            with open(tmp, "rb") as src:
+                shutil.copyfileobj(src, out, length=16*1024*1024)
+            os.remove(tmp)
 
     # verify
-    ds_count = os.path.getsize(dataset_path) // np.dtype(np.int64).itemsize
-    ds_mmap = np.memmap(dataset_path, dtype=np.int64, mode='r+', shape=(ds_count,))
-    print(tokenizer.decode(ds_mmap[-1000:]))
+    # ds_count = os.path.getsize(dataset_path) // np.dtype(np.int64).itemsize
+    # ds_mmap = np.memmap(dataset_path, dtype=np.int64, mode='r+', shape=(ds_count,))
+    # print(tokenizer.decode(ds_mmap[ds_count//2:ds_count//2 + 1000]))
 
 def train_model(
     dataset_path: str,
